@@ -7,10 +7,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from imblearn.under_sampling import RandomUnderSampler
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.naive_bayes import GaussianNB
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -21,53 +22,110 @@ from sklearn.metrics import (
     f1_score,
     classification_report,
     confusion_matrix,
+    roc_auc_score,
 )
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-DATASET_PATH = "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
+DATASET_DIR = Path("Bemeneti-adathalmaz")
 OUTPUT_DIR = Path("tanulas_eredmenyek")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TEST_SIZE = 0.20
 RANDOM_STATE = 42
 
 #Betoltes
-def load_dataset(path):
-    file_path = Path(path)
+def load_dataset(folder_path):
+    folder_path = Path(folder_path)
 
-    if not file_path.exists():
-        raise FileNotFoundError(f"Fajl nem talalhato: {file_path.resolve()}\n")
+    if not folder_path.exists():
+        raise FileNotFoundError(f"Adathalmaz mappa nem talalhato: {folder_path.resolve()}")
 
-    print("Adathalmaz betoltese...")
+    #Osszefuzott adathalmaz helye
+    merged_path = folder_path / "Bemeneti-adat-osszes.csv"
 
-    #Adat elofeldolgozasa
-    df = pd.read_csv(file_path, low_memory=False)
+    #letezik-e mar az osszefuzott fajl
+    if merged_path.exists():
 
-    df.columns = df.columns.str.strip() #szokoz eltavolitas
+        print("Meglevo osszefuzott csv betoltese...")
+        df = pd.read_csv(merged_path, low_memory=False)
 
-    df = df.loc[:, ~df.columns.duplicated()].copy() #duplikalas eltavolitasa
+    else:
 
+        print("CSV fajlok osszefuzese...")
+
+        csv_files = sorted(
+            file for file in folder_path.glob("*.csv")
+            if file.name != merged_path.name
+        )
+
+        if not csv_files:
+            raise FileNotFoundError("Nem talalhato CSV fajl a bemeneti mappaban.")
+
+        dataframes = []
+
+        for file in csv_files:
+
+            df_part = pd.read_csv(file, low_memory=False)
+
+            df_part.columns = df_part.columns.str.strip()
+            df_part = df_part.loc[:, ~df_part.columns.duplicated()]
+
+            dataframes.append(df_part)
+            reference_columns = set(dataframes[0].columns)
+
+            for i, df_part in enumerate(dataframes[1:], start=2):
+                if set(df_part.columns) != reference_columns:
+                    print(f"!!!Kulonbozo oszlopok talalhatoak CSV {i}-ben!!!")
+
+        # Osszes CSV osszefuzese
+        df = pd.concat(dataframes, ignore_index=True, sort=False)
+
+        del dataframes
+
+        # Oszlopnevek normalizalasa
+        df.columns = df.columns.str.strip()
+
+        # Duplikalt oszlopok eltavolitasa
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+
+        # Osszefuzott fajl mentese
+        df.to_csv(merged_path, index=False)
+
+        print(f"Osszefuzott adathalmaz mentve: {merged_path}")
+
+    # Oszlopnevek normalizalasa
+    df.columns = df.columns.str.strip()
+
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    # Label oszlop megkeresese
     label_columns = [
         col for col in df.columns
         if col.lower() == "label"
     ]
 
     if not label_columns:
-        raise ValueError(
-            "Kell 'Label' nevu oszlop az adathalmazban."
-        )
+        raise ValueError("Kell 'Label' nevu oszlop az adathalmazban.")
 
     label_column = label_columns[0]
-    labels = (df[label_column].astype("string").str.strip().str.upper()) #label oszlop normalizalasa
+
+    # Label normalizalasa
+    labels = (
+        df[label_column]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+    )
 
     valid_labels = labels.notna() & labels.ne("")
 
     df = df.loc[valid_labels].copy()
     labels = labels.loc[valid_labels]
 
-    y = (labels != "BENIGN").astype("int8") #benign - normal, nem benign - tamadas
+    # BENIGN = 0, ATTACK = 1
+    y = (labels != "BENIGN").astype("int8")
 
-    #Jellemzo oszlopok elofeldolgozasa
+    # Jellemzok elofeldolgozasa
     X = df.drop(columns=[label_column])
     X = X.apply(pd.to_numeric, errors="coerce")
     X = X.replace([np.inf, -np.inf], np.nan)
@@ -77,14 +135,14 @@ def load_dataset(path):
         raise ValueError("Nem talalhato szam alapu jellemzo.")
 
     if y.nunique() != 2:
-        raise ValueError(
-            "Adathalmaznak tartalmaznia kell normal es tamado forgalmat"
-        )
+        raise ValueError("Adathalmaznak tartalmaznia kell normal es tamado forgalmat.")
 
-    print(f"Adathalmaz alak: {df.shape}")
+    print("\n========== ADATHALMAZ INFORMACIOK ==========")
+    print(f"Adathalmaz alakja: {df.shape}")
     print(f"Jellemzok szama: {X.shape[1]}")
     print(f"Normal mintak: {(y == 0).sum():,}")
     print(f"Tamadas mintak: {(y == 1).sum():,}")
+    print("============================================")
 
     return X, y
 
@@ -104,12 +162,13 @@ def split_dataset(X, y):
 def create_models():
     naive_bayes = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
+        ("scaler", MinMaxScaler(feature_range=(0, 1))),
         ("classifier", GaussianNB()),
     ])
 
     decision_tree = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", MinMaxScaler(feature_range=(0, 1))), #Nem muszaj ennel a modellnel(data scaling [0 1])
         ("classifier", DecisionTreeClassifier(
             random_state=RANDOM_STATE,
             class_weight="balanced",
@@ -120,6 +179,7 @@ def create_models():
 
     random_forest = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", MinMaxScaler(feature_range=(0, 1))), #Nem muszaj ennel a modellnel(data scaling [0 1])
         ("classifier", RandomForestClassifier(
             n_estimators=150,
             random_state=RANDOM_STATE,
@@ -148,17 +208,13 @@ def train_and_evaluate(models, X_train, X_test, y_train, y_test):
         model.fit(X_train, y_train)
 
         predictions = model.predict(X_test)
+        probabilities = model.predict_proba(X_test)[:, 1]
 
         accuracy = accuracy_score(y_test, predictions)
-        precision = precision_score(
-            y_test, predictions, zero_division=0
-        )
-        recall = recall_score(
-            y_test, predictions, zero_division=0
-        )
-        f1 = f1_score(
-            y_test, predictions, zero_division=0
-        )
+        precision = precision_score(y_test, predictions, zero_division=0)
+        recall = recall_score(y_test, predictions, zero_division=0)
+        f1 = f1_score(y_test, predictions, zero_division=0)
+        roc_auc = roc_auc_score(y_test, probabilities)
 
         results.append({
             "Modell": name,
@@ -166,6 +222,7 @@ def train_and_evaluate(models, X_train, X_test, y_train, y_test):
             "Pontossag": precision,
             "Recall": recall,
             "F1-Score": f1,
+            "ROC-AUC": roc_auc
         })
 
         trained_models[name] = model
@@ -174,6 +231,7 @@ def train_and_evaluate(models, X_train, X_test, y_train, y_test):
         print(f"Pontossag: {precision:.4f}")
         print(f"Recall:    {recall:.4f}")
         print(f"F1-score:  {f1:.4f}")
+        print(f"ROC-AUC:  {roc_auc:.4f}")
 
         print("\nKlasszifikacio report:")
         print(classification_report(
@@ -215,7 +273,7 @@ def train_and_evaluate(models, X_train, X_test, y_train, y_test):
 #Osszehasonlitas
 def compare_models(results_df):
     print("\n")
-    print("Ideiglenes osszehasonlitas")
+    print("Modellek osszehasonlitasa")
     print(
         results_df.to_string(
             index=False,
@@ -228,7 +286,7 @@ def compare_models(results_df):
         )
     )
 
-    results_df.to_csv(OUTPUT_DIR / "modell_hasonlitas.csv", index=False)
+    #results_df.to_csv(OUTPUT_DIR / "modell_hasonlitas.csv", index=False)
 
     plt.figure(figsize=(9, 5))
     ax = sns.barplot(
@@ -252,6 +310,12 @@ def compare_models(results_df):
     plt.close()
 
 
+def undersample(X_train,y_train):
+    undersampler = RandomUnderSampler(sampling_strategy="auto", random_state=RANDOM_STATE)
+    X, y = undersampler.fit_resample(X_train, y_train)
+
+    return X, y
+
 #Modellek mentese
 def save_models(models):
     for name, model in models.items():
@@ -262,12 +326,19 @@ def save_models(models):
 
 
 def main():
-    X, y = load_dataset(DATASET_PATH)
+    X, y = load_dataset(DATASET_DIR)
 
     X_train, X_test, y_train, y_test = split_dataset(X, y)
+    print(f"\nTanulasi mintak undersampling elott: {len(X_train):,}")
+    print(f"Teszteles mintak: {len(X_test):,}")
 
+    X_train, y_train = undersample(X_train,y_train)
+
+    print("\nTanulasi adatok alulmintazas utan:")
     print(f"\nTanulasi mintak: {len(X_train):,}")
     print(f"Teszteles mintak:  {len(X_test):,}")
+    print(f"Normal mintak: {(y_train == 0).sum():,}")
+    print(f"Tamadas mintak: {(y_train == 1).sum():,}")
 
     models = create_models()
 
